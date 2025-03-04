@@ -1,13 +1,11 @@
 package me.vripper.download
 
-import kotlinx.coroutines.CoroutineScope
+import dev.failsafe.Failsafe
+import dev.failsafe.RetryPolicy
 import kotlinx.coroutines.Runnable
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
 import me.vripper.entities.ImageEntity
-import me.vripper.entities.LogEntryEntity
 import me.vripper.entities.PostEntity
-import me.vripper.entities.domain.Status
+import me.vripper.entities.Status
 import me.vripper.event.ErrorCountEvent
 import me.vripper.event.EventBus
 import me.vripper.event.QueueStateEvent
@@ -19,16 +17,13 @@ import me.vripper.services.DataTransaction
 import me.vripper.services.RetryPolicyService
 import me.vripper.services.SettingsService
 import me.vripper.services.VGAuthService
-import me.vripper.utilities.GLOBAL_EXECUTOR
-import me.vripper.utilities.formatToString
-import net.jodah.failsafe.Failsafe
-import net.jodah.failsafe.RetryPolicy
+import me.vripper.utilities.LoggerDelegate
+import me.vripper.utilities.downloadRunner
 import org.jetbrains.exposed.sql.transactions.transaction
-import java.util.concurrent.CompletableFuture
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
-class DownloadService(
+internal class DownloadService(
     private val settingsService: SettingsService,
     private val dataTransaction: DataTransaction,
     private val retryPolicyService: RetryPolicyService,
@@ -36,12 +31,11 @@ class DownloadService(
     private val eventBus: EventBus
 ) {
     private val maxPoolSize: Int = 24
-    private val log by me.vripper.delegate.LoggerDelegate()
+    private val log by LoggerDelegate()
     private val running: MutableMap<Byte, MutableList<ImageDownloadRunnable>> = mutableMapOf()
     private val pending: MutableMap<Byte, MutableList<ImageDownloadRunnable>> = mutableMapOf()
     private val lock = ReentrantLock()
     private val condition = lock.newCondition()
-    private val coroutineScope = CoroutineScope(SupervisorJob())
 
     init {
         Thread.ofVirtual().name("Download Loop").unstarted(Runnable {
@@ -51,14 +45,14 @@ class DownloadService(
                 lock.withLock {
                     candidates.addAll(getCandidates(candidateCount()))
                     candidates.forEach {
-                        if (canRun(it.context.imageEntity.host)) {
+                        if (canRun(it.imageEntity.host)) {
                             accepted.add(it)
-                            running[it.context.imageEntity.host]!!.add(it)
-                            log.debug("${it.context.imageEntity.url} accepted to run")
+                            running[it.imageEntity.host]!!.add(it)
+                            log.debug("${it.imageEntity.url} accepted to run")
                         }
                     }
                     accepted.forEach {
-                        pending[it.context.imageEntity.host]?.remove(it)
+                        pending[it.imageEntity.host]?.remove(it)
                         scheduleForDownload(it)
                     }
                     accepted.clear()
@@ -76,14 +70,10 @@ class DownloadService(
     fun stop(postIds: List<Long> = emptyList()) {
         if (postIds.isNotEmpty()) {
             stopInternal(postIds)
-            coroutineScope.launch {
-                eventBus.publishEvent(StoppedEvent(postIds))
-            }
+            eventBus.publishEvent(StoppedEvent(postIds))
         } else {
             stopAll()
-            coroutineScope.launch {
-                eventBus.publishEvent(StoppedEvent(listOf(-1)))
-            }
+            eventBus.publishEvent(StoppedEvent(listOf(-1)))
         }
     }
 
@@ -91,8 +81,9 @@ class DownloadService(
         if (postEntityIds.isNotEmpty()) {
             restart(postEntityIds.associateWith { dataTransaction.findByPostIdAndIsNotCompleted(it.postId) })
         } else {
-            restart(dataTransaction.findAllPosts()
-                .associateWith { dataTransaction.findByPostIdAndIsNotCompleted(it.postId) })
+            restart(
+                dataTransaction.findAllPosts()
+                    .associateWith { dataTransaction.findByPostIdAndIsNotCompleted(it.postId) })
         }
     }
 
@@ -129,10 +120,6 @@ class DownloadService(
                 )
             }
 
-            toProcess.keys.forEach {
-                vgAuthService.leaveThanks(it)
-            }
-
 
             toProcess.entries.forEach { (post, images) ->
                 images.forEach { image ->
@@ -152,17 +139,20 @@ class DownloadService(
     }
 
     private fun isPending(postId: Long): Boolean {
-        return pending.values.flatten().any { it.context.imageEntity.postId == postId }
+        return pending.values.flatten().any { it.imageEntity.postId == postId }
     }
 
     private fun isRunning(postId: Long): Boolean {
-        return running.values.flatten().any { it.context.imageEntity.postId == postId }
+        return running.values.flatten().any { it.imageEntity.postId == postId }
     }
 
     private fun stopAll() {
         lock.withLock {
             pending.values.clear()
             running.values.flatten().forEach { obj: ImageDownloadRunnable -> obj.stop() }
+            while (running.values.flatten().count { !it.completed } > 0) {
+                Thread.sleep(100)
+            }
             dataTransaction.findAllNonCompletedPostIds().forEach {
                 dataTransaction.stopImagesByPostIdAndIsNotCompleted(it)
                 dataTransaction.finishPost(it)
@@ -174,11 +164,16 @@ class DownloadService(
         lock.withLock {
             for (postId in postIds) {
                 pending.values.forEach { pending ->
-                    pending.removeIf { it.context.imageEntity.postId == postId }
+                    pending.removeIf { it.imageEntity.postId == postId }
                 }
                 running.values.flatten()
-                    .filter { p: ImageDownloadRunnable -> p.context.imageEntity.postId == postId }
+                    .filter { p: ImageDownloadRunnable -> p.imageEntity.postId == postId }
                     .forEach { obj: ImageDownloadRunnable -> obj.stop() }
+                while (running.values.flatten()
+                        .count { !it.completed && it.imageEntity.postId == postId } > 0
+                ) {
+                    Thread.sleep(100)
+                }
             }
             postIds.forEach {
                 dataTransaction.stopImagesByPostIdAndIsNotCompleted(it)
@@ -213,7 +208,7 @@ class DownloadService(
 
             val list: List<ImageDownloadRunnable> =
                 pending[host]!!.sortedWith(Comparator.comparingInt<ImageDownloadRunnable> { it.postRank }
-                    .thenComparingInt { it.context.imageEntity.index })
+                    .thenComparingInt { it.imageEntity.index })
 
             for (imageDownloadRunnable in list) {
                 val count = hostIntegerMap[host] ?: 0
@@ -229,59 +224,42 @@ class DownloadService(
     }
 
     private fun scheduleForDownload(imageDownloadRunnable: ImageDownloadRunnable) {
-        log.debug("Scheduling a job for ${imageDownloadRunnable.context.imageEntity.url}")
-        CompletableFuture.runAsync({
-            coroutineScope.launch {
-                eventBus.publishEvent(QueueStateEvent(QueueState(runningCount(), pendingCount())))
+        log.debug("Scheduling a job for ${imageDownloadRunnable.imageEntity.url}")
+        eventBus.publishEvent(QueueStateEvent(QueueState(runningCount(), pendingCount())))
+        Failsafe.with<Any, RetryPolicy<Any>>(retryPolicyService.buildRetryPolicy("Failed to download ${imageDownloadRunnable.imageEntity.url}: "))
+            .with(downloadRunner)
+            .onFailure {
+                log.error(
+                    "Failed to download ${imageDownloadRunnable.imageEntity.url} after ${it.attemptCount} tries",
+                    it.exception
+                )
+                val image = imageDownloadRunnable.imageEntity
+                image.status = Status.ERROR
+                dataTransaction.updateImage(image)
             }
-            Failsafe.with<Any, RetryPolicy<Any>>(retryPolicyService.buildRetryPolicyForDownload())
-                .onFailure {
-                    try {
-                        dataTransaction.saveLog(
-                            LogEntryEntity(
-                                type = LogEntryEntity.Type.DOWNLOAD,
-                                status = LogEntryEntity.Status.ERROR,
-                                message = "Failed to download ${imageDownloadRunnable.context.imageEntity.url}\n ${it.failure.formatToString()}"
-                            )
+            .onComplete {
+                afterJobFinish(imageDownloadRunnable)
+                eventBus.publishEvent(
+                    QueueStateEvent(
+                        QueueState(
+                            runningCount(), pendingCount()
                         )
-                    } catch (exp: Exception) {
-                        log.error("Failed to save event", exp)
-                    }
-                    log.error(
-                        "Failed to download ${imageDownloadRunnable.context.imageEntity.url} after ${it.attemptCount} tries",
-                        it.failure
                     )
-                    val image = imageDownloadRunnable.context.imageEntity
-                    image.status = Status.ERROR
-                    dataTransaction.updateImage(image)
-                }.onComplete {
-                    afterJobFinish(imageDownloadRunnable)
-                    coroutineScope.launch {
-                        eventBus.publishEvent(
-                            QueueStateEvent(
-                                QueueState(
-                                    runningCount(), pendingCount()
-                                )
-                            )
-                        )
-                    }
-                    coroutineScope.launch {
-                        eventBus.publishEvent(ErrorCountEvent(ErrorCount(dataTransaction.countImagesInError())))
-                    }
-                    log.debug(
-                        "Finished downloading ${imageDownloadRunnable.context.imageEntity.url}"
-                    )
-                }.run(imageDownloadRunnable::run)
-        }, GLOBAL_EXECUTOR)
+                )
+                eventBus.publishEvent(ErrorCountEvent(ErrorCount(dataTransaction.countImagesInError())))
+                log.debug(
+                    "Finished downloading ${imageDownloadRunnable.imageEntity.url}"
+                )
+            }.runAsync(imageDownloadRunnable)
     }
 
     private fun afterJobFinish(imageDownloadRunnable: ImageDownloadRunnable) {
         lock.withLock {
-            val image = imageDownloadRunnable.context.imageEntity
+            val image = imageDownloadRunnable.imageEntity
             running[image.host]!!.remove(imageDownloadRunnable)
             if (!isPending(image.postId) && !isRunning(
                     image.postId
-                ) && !imageDownloadRunnable.context.stopped
+                ) && !imageDownloadRunnable.stopped
             ) {
                 dataTransaction.finishPost(image.postId, true)
             }

@@ -1,9 +1,5 @@
 package me.vripper.services
 
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.decodeFromStream
@@ -12,6 +8,7 @@ import me.vripper.event.SettingsUpdateEvent
 import me.vripper.exception.ValidationException
 import me.vripper.model.Settings
 import me.vripper.utilities.ApplicationProperties.VRIPPER_DIR
+import me.vripper.utilities.LoggerDelegate
 import org.apache.commons.codec.digest.DigestUtils
 import java.io.FileWriter
 import java.nio.file.*
@@ -19,11 +16,10 @@ import kotlin.io.path.readText
 
 class SettingsService(private val eventBus: EventBus) {
 
-    private val log by me.vripper.delegate.LoggerDelegate()
+    private val log by LoggerDelegate()
     private val configPath = VRIPPER_DIR.resolve("config.json")
     private val customProxiesPath = VRIPPER_DIR.resolve("proxies.json")
     private val proxies: MutableSet<String> = HashSet()
-    private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     private val json = Json {
         encodeDefaults = true
@@ -39,10 +35,7 @@ class SettingsService(private val eventBus: EventBus) {
     private fun init() {
         loadViperProxies()
         restore()
-        coroutineScope.launch {
-            eventBus.publishEvent(SettingsUpdateEvent(settings))
-        }
-
+        eventBus.publishEvent(SettingsUpdateEvent(settings))
     }
 
     private fun loadViperProxies() {
@@ -57,7 +50,7 @@ class SettingsService(private val eventBus: EventBus) {
                             customProxiesPath.readText()
                         )
                     } catch (e: Exception) {
-                        e.printStackTrace()
+                        log.error("Failed to read custom proxies", e)
                         emptyList()
                     }
                 } else {
@@ -100,9 +93,7 @@ class SettingsService(private val eventBus: EventBus) {
         }
         this.settings = settings.copy(viperSettings = viperSettings)
         save()
-        coroutineScope.launch {
-            eventBus.publishEvent(SettingsUpdateEvent(this@SettingsService.settings))
-        }
+        eventBus.publishEvent(SettingsUpdateEvent(this@SettingsService.settings))
     }
 
     private fun restore() {
@@ -111,7 +102,7 @@ class SettingsService(private val eventBus: EventBus) {
                 settings = json.decodeFromString(configPath.readText())
             }
         } catch (e: Exception) {
-            log.error("Failed restore user settings", e)
+            log.error("Failed to restore user settings", e)
             settings = Settings()
         }
         if (!proxies.contains(settings.viperSettings.host)) {
@@ -195,6 +186,12 @@ class SettingsService(private val eventBus: EventBus) {
         if (settings.systemSettings.clipboardPollingRate < 500) {
             throw ValidationException(
                 "Invalid clipboard monitoring polling rate settings, values must be >= 500"
+            )
+        }
+
+        if (settings.viperSettings.requestLimit < 1 || settings.viperSettings.requestLimit > 6) {
+            throw ValidationException(
+                "Invalid request rate limit, values must be in [1,6]"
             )
         }
     }

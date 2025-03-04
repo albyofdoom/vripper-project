@@ -1,10 +1,17 @@
 package me.vripper.host
 
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.runBlocking
 import me.vripper.download.ImageDownloadContext
 import me.vripper.exception.DownloadException
 import me.vripper.exception.HostException
-import me.vripper.services.*
+import me.vripper.services.DataTransaction
+import me.vripper.services.DownloadSpeedService
+import me.vripper.services.HTTPService
 import me.vripper.utilities.HtmlUtils
+import me.vripper.utilities.LoggerDelegate
 import me.vripper.utilities.PathUtils.getFileNameWithoutExtension
 import org.apache.hc.client5.http.classic.methods.HttpGet
 import org.apache.hc.client5.http.classic.methods.HttpHead
@@ -12,17 +19,19 @@ import org.apache.hc.core5.http.ClassicHttpResponse
 import org.apache.hc.core5.http.Header
 import org.jetbrains.exposed.sql.transactions.transaction
 import org.w3c.dom.Document
+import java.io.BufferedOutputStream
 import java.nio.file.Files
 import java.nio.file.Path
+import kotlin.Throws
 
-abstract class Host(
+internal abstract class Host(
     val hostName: String,
     val hostId: Byte,
     private val httpService: HTTPService,
     private val dataTransaction: DataTransaction,
     private val downloadSpeedService: DownloadSpeedService
 ) {
-    private val log by me.vripper.delegate.LoggerDelegate()
+    private val log by LoggerDelegate()
 
     companion object {
         private const val READ_BUFFER_SIZE = 8192
@@ -94,10 +103,10 @@ abstract class Host(
             "vripper_",
             ".tmp"
         )
-        return Files.newOutputStream(tempImage).use { fos ->
+        return BufferedOutputStream(Files.newOutputStream(tempImage)).use { bos ->
             val image = context.imageEntity
             synchronized(image.postId.toString().intern()) {
-                val post = dataTransaction.findPostById(context.postId).orElseThrow()
+                val post = dataTransaction.findPostById(context.postId)
                 val size = if (image.size < 0) {
                     response.entity.contentLength
                 } else {
@@ -118,14 +127,23 @@ abstract class Host(
             )
             val buffer = ByteArray(READ_BUFFER_SIZE)
             var read: Int
-            while (response.entity.content.read(buffer, 0, READ_BUFFER_SIZE)
-                    .also { read = it } != -1 && !context.stopped
+            val reporterJob = context.launchCoroutine {
+                while (isActive) {
+                    dataTransaction.updateImage(image, false)
+                    delay(100)
+                }
+            }
+            while (response.entity.content.read(buffer)
+                    .also { read = it } != -1
             ) {
-                fos.write(buffer, 0, read)
+                bos.write(buffer, 0, read)
                 image.downloaded += read
-                dataTransaction.updateImage(image)
                 downloadSpeedService.reportDownloadedBytes(read.toLong())
             }
+            runBlocking {
+                reporterJob.cancelAndJoin()
+            }
+            dataTransaction.updateImage(image)
             Pair(tempImage, mimeType)
         }
     }

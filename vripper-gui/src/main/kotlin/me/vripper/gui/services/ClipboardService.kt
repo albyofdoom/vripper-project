@@ -4,17 +4,17 @@ import javafx.scene.input.Clipboard
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.filterIsInstance
-import me.vripper.delegate.LoggerDelegate
 import me.vripper.gui.event.GuiEventBus
 import me.vripper.model.Settings
 import me.vripper.services.IAppEndpointService
+import me.vripper.utilities.LoggerDelegate
 import tornadofx.Controller
 import tornadofx.runLater
 
 class ClipboardService : Controller() {
     private val logger by LoggerDelegate()
     private var current: String? = null
-    private var coroutineScope = CoroutineScope(SupervisorJob())
+    private var coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var pollJob: Job? = null
     private var subscribeJob: Job? = null
 
@@ -49,7 +49,7 @@ class ClipboardService : Controller() {
                     }
                     if (!value.isNullOrBlank() && value != current) {
                         current = value
-                        appEndpointService.scanLinks(value!!)
+                        appEndpointService.scanLinks(value)
                     }
                     delay(settings.systemSettings.clipboardPollingRate.toLong())
                 }

@@ -1,6 +1,9 @@
 package me.vripper.model
 
 import kotlinx.serialization.Serializable
+import me.vripper.utilities.ApplicationProperties.VRIPPER_DIR
+import java.nio.file.Files
+import kotlin.io.path.pathString
 
 @Serializable
 data class Settings(
@@ -17,11 +20,13 @@ data class ViperSettings(
     val password: String = "",
     val thanks: Boolean = false,
     val host: String = "https://vipergirls.to",
+    val requestLimit: Long = 4,
+    val fetchMetadata: Boolean = false,
 )
 
 @Serializable
 data class DownloadSettings(
-    val downloadPath: String = System.getProperty("user.home"),
+    val downloadPath: String = VRIPPER_DIR.resolve("downloads").also { Files.createDirectories(it) }.pathString,
     val autoStart: Boolean = true,
     val autoQueueThreshold: Int = 1,
     val forceOrder: Boolean = false,
@@ -41,7 +46,7 @@ data class ConnectionSettings(
 
 @Serializable
 data class SystemSettings(
-    val tempPath: String = System.getProperty("java.io.tmpdir"),
+    val tempPath: String = VRIPPER_DIR.resolve("temp").also { Files.createDirectories(it) }.pathString,
     val enableClipboardMonitoring: Boolean = false,
     val clipboardPollingRate: Int = 500,
     val maxEventLog: Int = 1_000,

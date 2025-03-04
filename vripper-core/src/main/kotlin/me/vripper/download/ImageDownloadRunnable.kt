@@ -1,19 +1,20 @@
 package me.vripper.download
 
-import kotlinx.coroutines.*
+import dev.failsafe.function.CheckedRunnable
 import me.vripper.entities.ImageEntity
-import me.vripper.entities.domain.Status
+import me.vripper.entities.Status
 import me.vripper.exception.DownloadException
 import me.vripper.exception.HostException
 import me.vripper.host.DownloadedImage
 import me.vripper.host.Host
 import me.vripper.host.ImageMimeType
 import me.vripper.model.Settings
-import me.vripper.services.*
+import me.vripper.services.DataTransaction
+import me.vripper.services.VGAuthService
+import me.vripper.utilities.LoggerDelegate
 import me.vripper.utilities.PathUtils.getExtension
 import me.vripper.utilities.PathUtils.getFileNameWithoutExtension
 import me.vripper.utilities.PathUtils.sanitize
-import net.jodah.failsafe.function.CheckedRunnable
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
 import java.io.IOException
@@ -24,32 +25,29 @@ import java.util.*
 import kotlin.io.path.Path
 import kotlin.io.path.pathString
 
-class ImageDownloadRunnable(
-    private val imageEntity: ImageEntity, val postRank: Int, private val settings: Settings
+internal class ImageDownloadRunnable(
+    val imageEntity: ImageEntity, val postRank: Int, private val settings: Settings
 ) : KoinComponent, CheckedRunnable {
-    private val log by me.vripper.delegate.LoggerDelegate()
-
+    private val log by LoggerDelegate()
     private val dataTransaction: DataTransaction by inject()
+    private val vgauthService: VGAuthService by inject()
     private val hosts: List<Host> = getKoin().getAll()
+    var completed = false
+    var stopped = false
 
-    val context: ImageDownloadContext = ImageDownloadContext(imageEntity, settings)
-    private var stopped: Boolean
-        get() = context.stopped
-        set(value) {
-            context.stopped = value
-        }
+    private lateinit var context: ImageDownloadContext
 
-    @Throws(DownloadException::class)
     fun download() {
         try {
             imageEntity.status = Status.DOWNLOADING
             imageEntity.downloaded = 0
             dataTransaction.updateImage(imageEntity)
             synchronized(imageEntity.postId.toString().intern()) {
-                val post = dataTransaction.findPostById(context.postId).orElseThrow()
+                val post = dataTransaction.findPostById(context.postId)
                 if (post.status != Status.DOWNLOADING) {
                     post.status = Status.DOWNLOADING
                     dataTransaction.updatePost(post)
+                    vgauthService.leaveThanks(post)
                 }
             }
             log.debug("Getting image url and name from ${imageEntity.url} using ${imageEntity.host}")
@@ -58,7 +56,7 @@ class ImageDownloadRunnable(
             log.debug("Resolved name for ${imageEntity.url}: ${downloadedImage.name}")
             log.debug("Downloaded image {} to {}", imageEntity.url, downloadedImage.path)
             synchronized(imageEntity.postId.toString().intern()) {
-                val post = dataTransaction.findPostById(context.postId).orElseThrow()
+                val post = dataTransaction.findPostById(context.postId)
                 val downloadDirectory = Path(post.downloadDirectory, post.folderName).pathString
                 checkImageTypeAndRename(
                     downloadDirectory, downloadedImage, imageEntity.index
@@ -123,12 +121,24 @@ class ImageDownloadRunnable(
         }
     }
 
-    @Throws(Exception::class)
     override fun run() {
-        if (stopped) {
-            return
+        context = ImageDownloadContext(imageEntity, settings)
+        try {
+            if (stopped) {
+                return
+            }
+            download()
+        } finally {
+            completed = true
+            context.cancelCoroutines()
         }
-        download()
+    }
+
+    fun stop() {
+        stopped = true
+        context.requests.forEach { it.abort() }
+        context.cancelCoroutines()
+        dataTransaction.updateImage(context.imageEntity)
     }
 
     override fun equals(other: Any?): Boolean {
@@ -140,10 +150,5 @@ class ImageDownloadRunnable(
 
     override fun hashCode(): Int {
         return Objects.hash(imageEntity.id)
-    }
-
-    fun stop() {
-        context.requests.forEach { it.abort() }
-        stopped = true
     }
 }
