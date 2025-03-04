@@ -173,7 +173,10 @@ internal class AppEndpointService(
                 .findMetadataByPostId(postId)
                 .map { it.data.resolvedNames }
                 .filter { it.isNotEmpty() }
-                .getOrNull()?.let { rename(postId, it.first()) }
+                .getOrNull()?.let { 
+                    val catName = it.first().plus("_").plus(postId)
+                    rename(postId, catName) 
+                }
         }
     }
 
